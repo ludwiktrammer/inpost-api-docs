@@ -34,16 +34,19 @@ in `API_REFERENCE.md` Appendix A but not modeled field-by-field.
 - **Find Paczkomaty / pickup points** near a location.
 - Log in, refresh tokens, manage tracked parcels, read notifications.
 
-The whole thing is a normal JSON-over-HTTPS API with Bearer tokens. If you've
-consumed any REST API, you already know how this works.
+The parcel API is normal JSON-over-HTTPS with Bearer tokens. OAuth token
+requests use form-encoded bodies. If you've consumed any REST API, you already
+know how this works.
 
 ---
 
 ## 60-second mental model
 
-1. **One base URL** (note the `/global`):
-   `https://api-inmobile-pl.easypack24.net/global`
-2. **Log in** → get an **access token** (`authToken`) + a **refresh token**.
+1. **Mobile base URL** (note the `/global`):
+   `https://api-inmobile-pl.easypack24.net/global`. Browser login uses
+   `https://account.inpost-group.com/oauth2/authorize`; token exchange/refresh
+   use `https://api-inmobile-pl.easypack24.net/global/oauth2/token`.
+2. **Log in** → get an **access token** (`access_token`) + a **refresh token**.
 3. Put `Authorization: Bearer <accessToken>` on every call.
 4. `GET /v4/parcels/tracked` → your parcels, each with a `status` and (when
    waiting in a locker) an `openCode` + `qrCode`.
@@ -56,46 +59,70 @@ That's the entire happy path. Everything else is detail.
 
 ## Quick start — the happy path
 
-### 1. Authenticate (SMS flow — recommended for non-app clients)
+### 1. Authenticate with Log InPost (OAuth + PKCE)
 
-Don't use the OAuth flow unless you must (it's WebView-based and painful to
-automate). The SMS flow is three JSON calls:
+Generate a random `code_verifier` (43–128 URL-safe characters), retain it locally,
+and compute `code_challenge = BASE64URL(SHA256(code_verifier))` without padding.
+Also generate and retain a random `state`. Open this URL in a browser, with query
+parameter values properly URL-encoded:
+
+```text
+https://account.inpost-group.com/oauth2/authorize
+  ?client_id=inpost-mobile
+  &redirect_uri=https%3A%2F%2Faccount.inpost-group.com%2Fcallback
+  &response_type=code
+  &response_mode=query
+  &scope=openid
+  &code_challenge=<challenge>
+  &code_challenge_method=S256
+  &state=<random-state>
+  &nonce=<random-nonce>
+  &prompt=login
+  &lang=pl
+  &theme=light
+  &supported_markets=PL%2CIT%2CES%2CPT
+```
+
+Complete the official login page's SMS and, when requested, e-mail verification.
+The callback is `https://account.inpost-group.com/callback?code=...&state=...`.
+Check the callback origin/path and `state` before exchanging the code. A custom
+client can intercept navigation to this registered callback in a WebView, or
+have the user copy its full address into the client. The callback page itself
+can be blank; the query parameters are what the client needs.
+
+Exchange the single-use code on the **mobile API host**:
 
 ```http
-POST /v1/account
-Content-Type: application/json
+POST https://api-inmobile-pl.easypack24.net/global/oauth2/token
+Content-Type: application/x-www-form-urlencoded
 
-{ "phoneNumber": { "prefix": "+48", "value": "600123456" } }
+client_id=inpost-mobile&grant_type=authorization_code&redirect_uri=https%3A%2F%2Faccount.inpost-group.com%2Fcallback&code_verifier=<verifier>&code=<code>
 ```
-→ user receives an SMS code. Some backend versions return an empty 2xx body;
-do not require a JSON response here.
+
+The response contains `access_token`, `refresh_token`, `id_token` and
+`expires_in` (seconds). No client secret or Bearer header is needed for this
+exchange. The access token can be used **directly** for the parcel API; no
+additional token exchange is required for listing parcels.
+
+Refresh using the same endpoint:
 
 ```http
-POST /v1/account/verification
-Content-Type: application/json
+POST https://api-inmobile-pl.easypack24.net/global/oauth2/token
+Content-Type: application/x-www-form-urlencoded
 
-{
-  "phoneNumber": { "prefix": "+48", "value": "600123456" },
-  "smsCode": "1234",
-  "devicePlatform": "Android"
-}
+client_id=inpost-mobile&grant_type=refresh_token&refresh_token=<refresh_token>
 ```
-→ `{ "authToken": "...", "refreshToken": "..." }`
 
-Store both. When `authToken` expires (you'll get a `401`), mint a new one:
-
-```http
-POST /v1/authenticate
-Content-Type: application/json
-
-{ "refreshToken": "...", "phoneOS": "Android" }
-```
+Persist **both** returned tokens before making subsequent calls: the refresh
+response supplies a replacement refresh token as well as an access token.
+Serialize refreshes per account to avoid races with token rotation. A failed
+refresh with OAuth `invalid_grant` requires a new browser login.
 
 ### 2. List inbound parcels
 
 ```http
 GET /v4/parcels/tracked
-Authorization: Bearer <authToken>
+Authorization: Bearer <access_token>
 ```
 → `{ "parcels": [ ... ], "removedParcelList": [...], "more": false }`
 
@@ -137,20 +164,20 @@ POST /v1/collect/compartment/claim { sessionUuid, shipmentNumbers:[...] }
 
 1. **Do not blindly concatenate `/global` with every path.** The default base is
    `https://api-inmobile-pl.easypack24.net/global`, but several documented
-   endpoints are root-relative (`/v1/account`, `/v4/parcels/tracked`). In
+   endpoints are root-relative (`/v4/parcels/tracked`). In
    standard HTTP clients, a leading `/` drops the base path. Verify the final
-   URL your client sends; SMS auth and tracked-parcel calls can work
-   working at host-root paths such as
-   `https://api-inmobile-pl.easypack24.net/v1/account`.
+   URL your client sends; tracked-parcel calls work at the host-root URL
+   `https://api-inmobile-pl.easypack24.net/v4/parcels/tracked`, while OAuth token
+   calls use `/global/oauth2/token` on that same mobile host.
 
 2. **A parcel has TWO different codes.** `openCode` ≠ `qrCode`. `openCode` is the
    short numeric code; `qrCode` is a long opaque token. The QR screen encodes
    `qrCode` **verbatim** — don't QR-encode the `openCode` and expect it to work,
    and don't try to derive one from the other.
 
-3. **Legacy SMS phone numbers include the `+` in the structured prefix.** Send
-   `"+48"` for the SMS login flow. Phone is a structured object
-   `{prefix, value}`, never a flat string.
+3. **OAuth token requests are form-encoded, not JSON.** Retain the PKCE
+   verifier until code exchange and check the callback `state`. Store both
+   tokens returned by every refresh, and serialize refreshes per account.
 
 4. **`status` is a free-form string, not an enum** in the payload (e.g.
    `ready_to_pickup`, `stack_in_box_machine`, `delivered`). Match on the strings
@@ -181,7 +208,8 @@ POST /v1/collect/compartment/claim { sessionUuid, shipmentNumbers:[...] }
    offset date-times, not naive local times.
 
 10. **Tokens: refresh reactively on `401`.** There's no documented proactive
-    skew. Simplest correct behavior: call → on 401, refresh once → retry.
+    skew. Simplest correct behavior: call → on 401, refresh once → save the
+    returned access/refresh token pair → retry.
 
 11. **TLS certificate pinning** in native clients does **not** affect your
     own client calling the API; it only affects traffic inspection of those
@@ -191,26 +219,31 @@ POST /v1/collect/compartment/claim { sessionUuid, shipmentNumbers:[...] }
 
 ## Headers: what you actually need
 
-Minimal working set, consistent with
+Minimal set used by the older v1 client
 [`alufers/inpost-cli`](https://github.com/alufers/inpost-cli):
 
 ```
 Authorization: Bearer <accessToken>     # on authenticated calls
-Content-Type: application/json            # on requests with a body
+Content-Type: application/json            # on JSON requests with a body
 Accept: application/json
 ```
 
 Common clients may also send `User-Agent`, `Device-ID`, `device-uid`,
-`Session-ID`, `X-App-Id`, `Accept-Language` — these are **not server-enforced**
-(telemetry / anti-abuse). Add a plausible `User-Agent` and a persisted random
-`device-uid` only if a v4/v5 endpoint ever pushes back. See
+`Session-ID`, `X-App-Id`, `Accept-Language`. The older client omits these;
+that does not establish their requirements for the OAuth/v4 flow. An
+app-style header set includes `X-App-Id: pl.inpost.inmobile`, `Protocol-Version: 1.1`,
+`Accept-Language: pl`, persisted UUIDs for `Device-ID` and `device-uid`, a
+`Session-ID` UUID, and the app-style User-Agent
+`InPost-Mobile/4.21.1(42101000) (Android 16; Pixel 9; Google tokay; pl)`.
+The code exchange and refresh work without those device headers and use
+`Content-Type: application/x-www-form-urlencoded`. See
 `API_REFERENCE.md §3, §11b`.
 
 ---
 
 ## Errors
 
-All errors share one envelope:
+Parcel/locker JSON errors use this envelope:
 
 ```jsonc
 {
@@ -220,6 +253,10 @@ All errors share one envelope:
   "diagnosticId": "…"          // quote this if you contact InPost
 }
 ```
+
+OAuth token errors use a separate format, e.g. HTTP 400
+`{"error":"invalid_grant"}`. Other failures may have an empty or non-JSON body;
+check the HTTP status before parsing JSON.
 
 Codes you'll meet on the locker flow: `invalidSession`, `sessionExpired`,
 `invalidSessionState`, `invalidCompartmentState`, `invalidParcelState`,
